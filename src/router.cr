@@ -1,3 +1,4 @@
+require "http/request"
 require "uri"
 require "./node"
 require "./result"
@@ -106,6 +107,10 @@ class Radbas::Routing::Router(T)
     path.lstrip("/").split("/").map(&->URI.decode(String))
   end
 
+  def match(request : HTTP::Request) : Result(T)
+    match(request.method, request.path)
+  end
+
   def match(method : String, path : String, params = {} of String => String) : Result(T)
     method = "GET" if method == "HEAD"
     cache_key = "#{method}#{path}"
@@ -121,6 +126,7 @@ class Radbas::Routing::Router(T)
     @cached_routes[cache_key] = result
   end
 
+  # ameba:disable Metrics/CyclomaticComplexity
   private def resolve(
     node : Node,
     tokens : Array(String),
