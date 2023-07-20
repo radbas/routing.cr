@@ -11,7 +11,7 @@ class Radbas::Routing::Node(T)
     @type : Type = Type::STATIC,
     @parent : Node(T)? = nil,
     @value : String = "",
-    @validator : Validator? = nil
+    @validator : Proc(String, Bool)? = nil
   )
     @static = {} of String => Node(T)
     @dynamic = {} of String => Node(T)

@@ -1,9 +1,10 @@
-require "http/request"
 require "uri"
 require "./node"
 require "./result"
 
 class Radbas::Routing::Router(T)
+  private alias Validator = Proc(String, Bool)
+
   MAX_CACHE_SIZE = 512
 
   @validators = {
