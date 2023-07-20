@@ -1,4 +1,5 @@
 require "spec"
+require "http/request"
 require "../src/radbas-routing"
 
 alias Router = Radbas::Routing::Router(Int32)

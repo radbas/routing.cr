@@ -8,21 +8,25 @@ class Radbas::Routing::Router(T)
   MAX_CACHE_SIZE = 512
 
   @validators = {
+    # word
     w: ->(s : String) : Bool {
       return false if s.empty?
       s.squeeze { |c| return false unless c.ascii_alphanumeric? || c == '_' }
       true
     },
+    # alphanumeric
     a: ->(s : String) : Bool {
       return false if s.empty?
       s.squeeze { |c| return false unless c.ascii_alphanumeric? }
       true
     },
+    # letters
     l: ->(s : String) : Bool {
       return false if s.empty?
       s.squeeze { |c| return false unless c.ascii_letter? }
       true
     },
+    # digits
     d: ->(s : String) : Bool {
       return false if s.empty?
       s.squeeze { |c| return false unless c.ascii_number? }
@@ -68,10 +72,10 @@ class Radbas::Routing::Router(T)
     "#{@base_path}#{parts.reverse.join("/")}"
   end
 
-  def map(method : String, path : String, handler : T, name : Symbol? = nil) : self
+  def map(methods : Array(String), path : String, handler : T, name : Symbol? = nil) : self
     leaf = apply(@route_tree, tokenize(path))
     @node_handlers[leaf] ||= {} of String => T
-    @node_handlers[leaf][method] = handler
+    methods.each { |m| @node_handlers[leaf][m] = handler }
     @named_routes[name] = leaf if name
     @cached_routes.clear
     self

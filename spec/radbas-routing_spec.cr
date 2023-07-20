@@ -4,7 +4,7 @@ describe Radbas::Routing do
   describe "#match" do
     it "matches static path" do
       router = Router.new
-      router.map("GET", "/hello/world", 1)
+      router.map(["GET"], "/hello/world", 1)
 
       result = router.match("GET", "hello/world")
       result.should be_a Result
@@ -18,7 +18,7 @@ describe Radbas::Routing do
 
     it "matches dynamic path" do
       router = Router.new
-      router.map("GET", "/hello/:name", 2)
+      router.map(["GET"], "/hello/:name", 2)
 
       result = router.match("GET", "hello/john")
       result.match?.should eq true
@@ -32,7 +32,7 @@ describe Radbas::Routing do
 
     it "matches catchall path" do
       router = Router.new
-      router.map("GET", "/hello/*all", 3)
+      router.map(["GET"], "/hello/*all", 3)
 
       result = router.match("GET", "hello/world")
       result.match?.should eq true
@@ -50,7 +50,7 @@ describe Radbas::Routing do
 
     it "matches http request" do
       router = Router.new
-      router.map("GET", "/hello/world", 4)
+      router.map(["GET"], "/hello/world", 4)
       request = HTTP::Request.new("GET", "/hello/world")
 
       result = router.match(request)

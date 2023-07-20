@@ -28,7 +28,7 @@ alias Handler = Proc(Context, Params, Nil)
 router = Radbas::Routing::Router(Handler).new
 
 # define routes
-router.map("GET", "/hello/:name", ->(context : Context, params : Params) {
+router.map(["GET"], "/hello/:name", ->(context : Context, params : Params) {
   name = params["name"]?
   context.response.write "Hello #{name}".to_slice
 })
