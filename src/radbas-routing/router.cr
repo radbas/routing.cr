@@ -5,7 +5,7 @@ require "./result"
 class Radbas::Routing::Router(T)
   private alias Validator = Proc(String, Bool)
 
-  MAX_CACHE_SIZE = 512
+  MAX_CACHE_SIZE = 1024
 
   @validators = {
     # word
@@ -33,8 +33,6 @@ class Radbas::Routing::Router(T)
       true
     },
   }
-
-  property base_path = ""
 
   def initialize
     @route_tree = Node(T).new
@@ -69,7 +67,7 @@ class Radbas::Routing::Router(T)
       end
       node = node.parent
     end
-    "#{@base_path}#{parts.reverse.join("/")}"
+    parts.reverse.join("/")
   end
 
   def map(methods : Array(String), path : String, handler : T, name : Symbol? = nil) : self
@@ -124,7 +122,7 @@ class Radbas::Routing::Router(T)
       return result
     end
 
-    tokens = tokenize(path.lchop(@base_path))
+    tokens = tokenize(path)
     result = resolve(@route_tree, tokens, method, params, 0, [] of String)
 
     @cached_routes.shift? unless @cached_routes.size < MAX_CACHE_SIZE
