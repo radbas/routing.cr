@@ -18,12 +18,12 @@ describe Radbas::Routing do
 
     it "matches dynamic path" do
       router = Router.new
-      router.map(["GET"], "/hello/:name", 2)
+      router.map(["GET"], "/hello/:name/:age:d", 2)
 
-      result = router.match("GET", "hello/john")
+      result = router.match("GET", "hello/john/22")
       result.match?.should eq true
       result.handler.should eq 2
-      result.params.should eq({"name" => "john"})
+      result.params.should eq({"name" => "john", "age" => "22"})
 
       result = router.match("GET", "hello/john/")
       result.match?.should eq false
@@ -56,6 +56,28 @@ describe Radbas::Routing do
       result = router.match(request)
       result.match?.should eq true
       result.handler.should eq 4
+    end
+
+    it "provides allowed methods" do
+      router = Router.new
+      router.map(["GET"], "/hello", 2)
+
+      result = router.match("GET", "hello")
+      result.match?.should eq true
+      result.handler.should eq 2
+      result.methods.should eq([] of String)
+
+      router.map(["POST"], "/hello", 3)
+
+      result = router.match("POST", "hello")
+      result.match?.should eq true
+      result.handler.should eq 3
+      result.methods.should eq([] of String)
+
+      result = router.match("PUT", "hello")
+      result.match?.should eq false
+      result.handler.should eq nil
+      result.methods.should eq ["GET", "POST"]
     end
   end
 end

@@ -125,58 +125,53 @@ class Radbas::Routing::Router(T)
     end
 
     tokens = tokenize(path.lchop(@base_path))
-    result = resolve(@route_tree, tokens, method, params, 0)
+    result = resolve(@route_tree, tokens, method, params, 0, [] of String)
 
     @cached_routes.shift? unless @cached_routes.size < MAX_CACHE_SIZE
     @cached_routes[cache_key] = result
   end
 
-  # ameba:disable Metrics/CyclomaticComplexity
   private def resolve(
     node : Node,
     tokens : Array(String),
     method : String,
     params : Hash(String, String),
-    index : UInt32
+    index : Int32,
+    allowed_methods : Array(String)
   ) : Result(T)
-    while index < tokens.size
-      token = tokens[index]
-      index += 1
-      # static
-      if next_node = node.static[token]?
-        node = next_node
-        next
-      end
+    # end
+    unless token = tokens[index]?
+      handlers = @node_handlers[node]?
+      handler = handlers && handlers[method]?
+      methods = !handler && handlers ? handlers.keys : [] of String
 
-      allowed_methods = [] of String
-      # dynamic
-      node.dynamic.each_value do |d_node|
-        next if d_node.validator && !d_node.validator.as(Validator).call(token)
-        params[d_node.value] = token
-        result = resolve(d_node, tokens, method, params, index)
-        return result if result.match?
-        allowed_methods.concat(result.methods)
-        params.delete(d_node.value)
-      end
-
-      # catchall
-      escape = false
-      node.catchall.each_value do |c_node|
-        next if c_node.validator && !c_node.validator.as(Validator).call(token)
-        params[c_node.value] = "#{tokens.skip(index - 1).join("/")}"
-        node = c_node
-        escape = true
-        break
-      end
-
-      break if escape
-      return Result(T).new(methods: allowed_methods.uniq)
+      return Result(T).new(handler, methods, params)
     end
 
-    handlers = @node_handlers[node]?
-    handler = handlers && handlers[method]?
-    methods = !handler && handlers ? handlers.keys : [] of String
+    # static
+    if static_node = node.static[token]?
+      return resolve(static_node, tokens, method, params, index + 1, allowed_methods)
+    end
 
-    Result(T).new(handler, methods, params)
+    # dynamic
+    node.dynamic.each_value do |dynamic_node|
+      next if dynamic_node.validator && !dynamic_node.validator.as(Validator).call(token)
+      result = resolve(dynamic_node, tokens, method, params, index + 1, allowed_methods)
+      if result.match?
+        result.params[dynamic_node.value] = token
+        return result
+      end
+      allowed_methods.concat(result.methods)
+    end
+
+    # catchall
+    node.catchall.each_value do |catchall_node|
+      next if catchall_node.validator && !catchall_node.validator.as(Validator).call(token)
+      params[catchall_node.value] = "#{tokens.skip(index).join("/")}"
+      return resolve(catchall_node, tokens, method, params, tokens.size, allowed_methods)
+    end
+
+    # token mismatch
+    Result(T).new(methods: allowed_methods.uniq)
   end
 end
