@@ -5,31 +5,31 @@ require "./result"
 class Radbas::Routing::Router(T)
   private alias Validator = Proc(String, Bool)
 
-  MAX_CACHE_SIZE = 1024
+  MAX_CACHE_SIZE = 1024_u16
 
   @validators = {
     # word
-    w: ->(s : String) : Bool {
-      return false if s.empty?
-      s.squeeze { |c| return false unless c.ascii_alphanumeric? || c == '_' }
+    w: ->(str : String) : Bool {
+      return false if str.empty?
+      str.squeeze { |char| return false unless char.ascii_alphanumeric? || char == '_' }
       true
     },
     # alphanumeric
-    a: ->(s : String) : Bool {
-      return false if s.empty?
-      s.squeeze { |c| return false unless c.ascii_alphanumeric? }
+    a: ->(str : String) : Bool {
+      return false if str.empty?
+      str.squeeze { |char| return false unless char.ascii_alphanumeric? }
       true
     },
     # letters
-    l: ->(s : String) : Bool {
-      return false if s.empty?
-      s.squeeze { |c| return false unless c.ascii_letter? }
+    l: ->(str : String) : Bool {
+      return false if str.empty?
+      str.squeeze { |char| return false unless char.ascii_letter? }
       true
     },
     # digits
-    d: ->(s : String) : Bool {
-      return false if s.empty?
-      s.squeeze { |c| return false unless c.ascii_number? }
+    d: ->(str : String) : Bool {
+      return false if str.empty?
+      str.squeeze { |char| return false unless char.ascii_number? }
       true
     },
   }
@@ -73,7 +73,7 @@ class Radbas::Routing::Router(T)
   def map(methods : Array(String), path : String, handler : T, name : Symbol? = nil) : self
     leaf = apply(@route_tree, tokenize(path))
     @node_handlers[leaf] ||= {} of String => T
-    methods.each { |m| @node_handlers[leaf][m] = handler }
+    methods.each { |method| @node_handlers[leaf][method] = handler }
     @named_routes[name] = leaf if name
     @cached_routes.clear
     self
@@ -129,13 +129,14 @@ class Radbas::Routing::Router(T)
     @cached_routes[cache_key] = result
   end
 
+  # ameba:disable Metrics/CyclomaticComplexity
   private def resolve(
     node : Node,
     tokens : Array(String),
     method : String,
     params : Hash(String, String),
     index : Int32,
-    allowed_methods : Array(String)
+    allowed_methods : Array(String),
   ) : Result(T)
     # end
     unless token = tokens[index]?
@@ -148,7 +149,9 @@ class Radbas::Routing::Router(T)
 
     # static
     if static_node = node.static[token]?
-      return resolve(static_node, tokens, method, params, index + 1, allowed_methods)
+      result = resolve(static_node, tokens, method, params, index + 1, allowed_methods)
+      return result if result.match?
+      allowed_methods.concat(result.methods)
     end
 
     # dynamic
