@@ -3,12 +3,28 @@ require "./error"
 require "./node"
 require "./result"
 
+# Maps HTTP methods and paths to handlers of type `T`.
+#
 # Routes are matched in order of priority: static > dynamic > catchall.
 # The router is read-only while matching; define all routes before serving requests.
+#
+# ```
+# router = Radbas::Routing::Router(Int32).new
+# router.map("GET", "/users/:id:d", 1, name: "user")
+# router.match("GET", "/users/42").params # => {"id" => "42"}
+# router.build("user", {id: 42})          # => "/users/42"
+# ```
 class Radbas::Routing::Router(T)
+  # Decides whether a param value is acceptable.
   alias Validator = Proc(String, Bool)
 
-  VALIDATORS = {
+  private alias Params = Hash(String, String)
+  private alias Methods = Array(String)
+
+  private SLASH   = '/'.ord.to_u8
+  private PERCENT = '%'.ord.to_u8
+
+  private VALIDATORS = {
     # word
     "w" => ->(str : String) { str.to_slice.all? { |byte| byte.chr.ascii_alphanumeric? || byte == '_'.ord } },
     # alphanumeric
@@ -21,40 +37,67 @@ class Radbas::Routing::Router(T)
 
   @validators : Hash(String, Validator) = VALIDATORS.dup
   @root = Node(T).new
-  @named_routes = {} of Symbol => Node(T)
+  @named_routes = {} of String => Node(T)
   # Routes without params, keyed by their decoded path.
   @static_routes = {} of String => Node(T)
 
+  def initialize
+    {% if T.nilable? %}
+      # a nil handler would be indistinguishable from no match
+      {% raise "Router handler type must not be nilable, got #{T}" %}
+    {% end %}
+  end
+
+  # Registers a validator usable in route params as `:param:name` or `*param:name`.
+  # Built in: `w` (word characters), `a` (alphanumeric), `l` (letters), `d` (digits).
+  #
+  # Only affects routes mapped afterwards.
   def add_validator(name : String, &validator : String -> Bool) : self
     @validators[name] = validator
     self
   end
 
-  def has?(name : Symbol) : Bool
+  # Whether a route with this name was mapped.
+  def has?(name : String) : Bool
     @named_routes.has_key?(name)
   end
 
-  # `params` is anything indexable by param name, e.g. a `NamedTuple` or `Hash`.
-  def build(name : Symbol, params = NamedTuple.new) : String
+  # Builds the path of the route named *name*, percent-encoding all segments.
+  #
+  # *params* is anything indexable by param name, e.g. a `NamedTuple` or `Hash(String, _)`.
+  # Raises `Error` if the route does not exist, or if a param is missing or rejected by its validator.
+  def build(name : String, params = NamedTuple.new) : String
     node = @named_routes[name]? || raise Error.new("No route named #{name}")
     segments = [] of String
     while parent = node.parent
       segments << case node.type
       in .static?    then URI.encode_path_segment(node.value)
-      in .dynamic?   then URI.encode_path_segment(param(params, node.value))
-      in .catch_all? then URI.encode_path(param(params, node.value))
+      in .dynamic?   then URI.encode_path_segment(param(params, node))
+      in .catch_all? then URI.encode_path(param(params, node))
       end
       node = parent
     end
     "/#{segments.reverse!.join('/')}"
   end
 
-  private def param(params, name : String) : String
+  private def param(params, node : Node(T)) : String
+    name = node.value
     value = params[name]? || raise Error.new("No value given for param #{name}")
-    value.to_s
+    value = value.to_s
+    raise Error.new("Invalid value for param #{name}: #{value.inspect}") unless node.valid?(value)
+    value
   end
 
-  def map(methods : Array(String), path : String, handler : T, name : Symbol? = nil) : self
+  # Maps *method* and *path* to *handler*. See `#map(methods, path, handler, name)`.
+  def map(method : String, path : String, handler : T, *, name : String? = nil) : self
+    map([method], path, handler, name: name)
+  end
+
+  # Maps each of *methods* and *path* to *handler*, optionally naming the route for `#build`.
+  #
+  # Mapping the same path again adds or replaces methods on the existing route.
+  # Raises `Error` on an invalid path, an unknown validator, or a name already used by another route.
+  def map(methods : Array(String), path : String, handler : T, *, name : String? = nil) : self
     node = insert(path)
     if name
       existing = @named_routes[name]?
@@ -95,7 +138,7 @@ class Radbas::Routing::Router(T)
         end
       else
         value = decode(segment)
-        node = node.static[value] ||= Node(T).new(:static, node, value)
+        node = node.static[value.to_slice] ||= Node(T).new(:static, node, value)
       end
     end
     # decoded "%2F" must not collide with a real "/"
@@ -111,67 +154,125 @@ class Radbas::Routing::Router(T)
     {name, validator}
   end
 
+  # Matches the request's method and path.
   def match(request : HTTP::Request) : Result(T)
     match(request.method, request.path)
   end
 
+  # Matches *method* and the still percent-encoded *path*.
+  #
+  # `HEAD` falls back to the `GET` handler. Never mutates the router, so it is safe across threads.
   def match(method : String, path : String) : Result(T)
-    if !path.includes?('%') && (node = @static_routes[path]?) && (found = handler(node, method))
+    # keys never contain '%', so encoded paths cannot hit
+    if (node = @static_routes[path]?) && (found = handler(node, method))
       return Result(T).new(found[0])
     end
 
-    params = {} of String => String
-    methods = [] of String
-    segments = path.split('/').map! { |segment| decode(segment) }
-    # skip leading slashes without copying the path
-    start = segments.index(&.presence) || segments.size - 1
-
-    if found = resolve(@root, segments, start, method, params, methods)
-      return Result(T).new(found[0], methods.clear, params)
+    # skip leading slashes; "/" itself ends up at the empty segment
+    pos = 0
+    while pos < path.bytesize && path.to_unsafe[pos] == SLASH
+      pos += 1
     end
+
+    found, params, methods = resolve(@root, path, pos, method, nil, nil)
+    return Result(T).new(found[0], params) if found
 
     # RFC 9110 9.3.2: GET implies HEAD
-    methods << "HEAD" if methods.includes?("GET") && !methods.includes?("HEAD")
-    Result(T).new(methods: methods)
+    methods << "HEAD" if methods && methods.includes?("GET") && !methods.includes?("HEAD")
+    Result(T).new(allowed_methods: methods)
   end
 
+  # Matches the segment of *path* starting at byte *pos* (-1 past the end) against the children of *node*.
+  #
   # Returns the handler wrapped in a tuple, so a falsey `T` still counts as a match.
-  # Params are only written once a match is certain.
+  # Params are only written once a match is certain. Params and methods are allocated on first
+  # write and passed back up, so matches without them allocate nothing.
   private def resolve(
     node : Node(T),
-    segments : Array(String),
-    index : Int32,
+    path : String,
+    pos : Int32,
     method : String,
-    params : Hash(String, String),
-    methods : Array(String),
-  ) : Tuple(T)?
-    unless segment = segments[index]?
-      found = handler(node, method)
-      if !found && (handlers = node.handlers)
-        handlers.each_key { |key| methods << key unless methods.includes?(key) }
-      end
-      return found
+    params : Params?,
+    methods : Methods?,
+  ) : {Tuple(T)?, Params?, Methods?}
+    return resolve_end(node, method, params, methods) if pos < 0
+    # the catchall decodes the whole rest itself
+    return resolve_catchall(node, path, pos, method, params, methods) if node.static.empty? && node.dynamic.empty?
+    resolve_segment(node, path, pos, method, params, methods)
+  end
+
+  private def resolve_segment(
+    node : Node(T),
+    path : String,
+    pos : Int32,
+    method : String,
+    params : Params?,
+    methods : Methods?,
+  ) : {Tuple(T)?, Params?, Methods?}
+    stop = path.byte_index(SLASH, pos) || path.bytesize
+    next_pos = stop < path.bytesize ? stop + 1 : -1
+    raw = path.to_slice[pos, stop - pos]
+    decoded = URI.decode(path.byte_slice(pos, stop - pos)) if raw.includes?(PERCENT)
+
+    if child = node.static[decoded.try(&.to_slice) || raw]?
+      found, params, methods = resolve(child, path, next_pos, method, params, methods)
+      return {found, params, methods} if found
     end
 
-    if child = node.static[segment]?
-      found = resolve(child, segments, index + 1, method, params, methods)
-      return found if found
+    unless node.dynamic.empty?
+      segment = decoded || path.byte_slice(pos, stop - pos)
+      found, params, methods = resolve_dynamic(node, segment, path, next_pos, method, params, methods)
+      return {found, params, methods} if found
     end
 
+    resolve_catchall(node, path, pos, method, params, methods)
+  end
+
+  private def resolve_end(node : Node(T), method : String, params : Params?, methods : Methods?) : {Tuple(T)?, Params?, Methods?}
+    found = handler(node, method)
+    if !found && (handlers = node.handlers)
+      methods ||= Methods.new
+      handlers.each_key { |key| methods << key unless methods.includes?(key) }
+    end
+    {found, params, methods}
+  end
+
+  private def resolve_dynamic(
+    node : Node(T),
+    segment : String,
+    path : String,
+    next_pos : Int32,
+    method : String,
+    params : Params?,
+    methods : Methods?,
+  ) : {Tuple(T)?, Params?, Methods?}
     node.dynamic.each do |dynamic|
       next unless dynamic.valid?(segment)
-      if found = resolve(dynamic, segments, index + 1, method, params, methods)
-        params[dynamic.value] = segment
-        return found
-      end
+      found, params, methods = resolve(dynamic, path, next_pos, method, params, methods)
+      next unless found
+      params ||= Params.new
+      params[dynamic.value] = segment
+      return {found, params, methods}
     end
+    {nil, params, methods}
+  end
 
-    return unless catchall = node.catchall
-    value = segments[index..].join('/')
-    return unless catchall.valid?(value)
-    return unless found = resolve(catchall, segments, segments.size, method, params, methods)
+  private def resolve_catchall(
+    node : Node(T),
+    path : String,
+    pos : Int32,
+    method : String,
+    params : Params?,
+    methods : Methods?,
+  ) : {Tuple(T)?, Params?, Methods?}
+    return {nil, params, methods} unless catchall = node.catchall
+    value = decode(path.byte_slice(pos))
+    return {nil, params, methods} unless catchall.valid?(value)
+    found, params, methods = resolve(catchall, path, -1, method, params, methods)
+    return {nil, params, methods} unless found
+    params ||= Params.new
     params[catchall.value] = value
-    found
+    {found, params, methods}
   end
 
   private def handler(node : Node(T), method : String) : Tuple(T)?

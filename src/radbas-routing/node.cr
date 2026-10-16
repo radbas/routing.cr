@@ -10,7 +10,8 @@ class Radbas::Routing::Node(T)
   getter parent : Node(T)?
   getter value : String
   getter validator : Proc(String, Bool)?
-  getter static = {} of String => Node(T)
+  # Keyed by the decoded segment's bytes, so a request path can be looked up without copying.
+  getter static = {} of Bytes => Node(T)
   getter dynamic = [] of Node(T)
   property catchall : Node(T)?
   property handlers : Hash(String, T)?

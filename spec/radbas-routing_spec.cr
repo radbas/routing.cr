@@ -137,13 +137,13 @@ describe Radbas::Routing::Router do
 
       result = router.match("POST", "/hello")
       result.handler.should eq 3
-      result.methods.should be_empty
+      result.allowed_methods.should be_empty
 
       result = router.match("PUT", "/hello")
       result.match?.should be_false
-      result.methods.should eq ["GET", "POST", "HEAD"]
+      result.allowed_methods.should eq ["GET", "POST", "HEAD"]
 
-      router.match("PUT", "/nope").methods.should be_empty
+      router.match("PUT", "/nope").allowed_methods.should be_empty
     end
 
     it "collects allowed methods across routes" do
@@ -151,7 +151,80 @@ describe Radbas::Routing::Router do
       router.map(["GET"], "/a/b", 1)
       router.map(["PUT"], "/a/*rest", 2)
 
-      router.match("DELETE", "/a/b").methods.should eq ["GET", "PUT", "HEAD"]
+      router.match("DELETE", "/a/b").allowed_methods.should eq ["GET", "PUT", "HEAD"]
+    end
+
+    it "provides allowed methods when the static fast path misses the method" do
+      router = Router.new
+      router.map("GET", "/a", 1)
+
+      result = router.match("PUT", "/a")
+      result.match?.should be_false
+      result.allowed_methods.should eq ["GET", "HEAD"]
+    end
+
+    it "allocates no params or methods on a plain match" do
+      router = Router.new
+      router.map("GET", "/a", 1)
+
+      result = router.match("GET", "/a")
+      result.params.should be_empty
+      result.allowed_methods.should be_empty
+    end
+
+    it "matches the root route with any number of leading slashes" do
+      router = Router.new
+      router.map("GET", "/", 1)
+      router.map("GET", "/a", 2)
+
+      router.match("GET", "").handler.should eq 1
+      router.match("GET", "///").handler.should eq 1
+      router.match("GET", "//a").handler.should eq 2
+    end
+
+    it "treats trailing and double slashes as significant" do
+      router = Router.new
+      router.map("GET", "/a/b", 1)
+      router.map("GET", "/c/", 2)
+
+      router.match("GET", "/a/b/").match?.should be_false
+      router.match("GET", "/a//b").match?.should be_false
+      router.match("GET", "/c/").handler.should eq 2
+      router.match("GET", "/c").match?.should be_false
+    end
+
+    it "matches percent-encoded static segments" do
+      router = Router.new
+      router.map("GET", "/A/b", 1)
+      router.map("GET", "/c%20d", 2)
+
+      router.match("GET", "/%41/b").handler.should eq 1
+      router.match("GET", "/c d").handler.should eq 2
+      router.match("GET", "/c%20d").handler.should eq 2
+    end
+
+    it "passes invalid percent-encoding and non UTF-8 values through" do
+      router = Router.new
+      router.map("GET", "/f/:name", 1)
+
+      router.match("GET", "/f/%zz").params.should eq({"name" => "%zz"})
+      router.match("GET", "/f/%FF").params["name"].valid_encoding?.should be_false
+    end
+
+    it "decodes catchall values" do
+      router = Router.new
+      router.map("GET", "/s/*path", 1)
+
+      router.match("GET", "/s/a%20b/c%2Fd").params.should eq({"path" => "a b/c/d"})
+    end
+
+    it "matches falsey handlers" do
+      router = Radbas::Routing::Router(Bool).new
+      router.map("GET", "/a", false)
+      router.map("GET", "/b/:id", false)
+
+      router.match("GET", "/a").match?.should be_true
+      router.match("GET", "/b/1").match?.should be_true
     end
 
     it "is safe to call concurrently" do
@@ -175,6 +248,22 @@ describe Radbas::Routing::Router do
   end
 
   describe "#map" do
+    it "maps a single method" do
+      router = Router.new.map("GET", "/a", 1, name: "a")
+
+      router.match("GET", "/a").handler.should eq 1
+      router.has?("a").should be_true
+    end
+
+    it "keeps validators per router" do
+      router = Router.new.add_validator("d") { true }
+      router.map("GET", "/a/:id:d", 1)
+      other = Router.new.map("GET", "/a/:id:d", 1)
+
+      router.match("GET", "/a/x").match?.should be_true
+      other.match("GET", "/a/x").match?.should be_false
+    end
+
     it "rejects segments after a catchall" do
       expect_raises(Radbas::Routing::Error) { Router.new.map(["GET"], "/x/*rest/edit", 1) }
     end
@@ -194,31 +283,50 @@ describe Radbas::Routing::Router do
     end
 
     it "rejects duplicate route names" do
-      router = Router.new.map(["GET"], "/a", 1, :a)
-      router.map(["POST"], "/a", 2, :a).has?(:a).should be_true
-      expect_raises(Radbas::Routing::Error) { router.map(["GET"], "/b", 1, :a) }
+      router = Router.new.map(["GET"], "/a", 1, name: "a")
+      router.map(["POST"], "/a", 2, name: "a").has?("a").should be_true
+      expect_raises(Radbas::Routing::Error) { router.map(["GET"], "/b", 1, name: "a") }
     end
   end
 
   describe "#build" do
     it "builds routes" do
       router = Router.new
-      router.map(["GET"], "/", 1, :root)
-      router.map(["GET"], "/a b", 1, :static)
-      router.map(["GET"], "/users/:id:d", 1, :user)
-      router.map(["GET"], "/files/*path", 1, :files)
+      router.map(["GET"], "/", 1, name: "root")
+      router.map(["GET"], "/a b", 1, name: "static")
+      router.map(["GET"], "/users/:id:d", 1, name: "user")
+      router.map(["GET"], "/files/*path", 1, name: "files")
 
-      router.build(:root).should eq "/"
-      router.build(:static).should eq "/a%20b"
-      router.build(:user, {id: 5}).should eq "/users/5"
-      router.build(:files, {"path" => "a/b c"}).should eq "/files/a/b%20c"
+      router.build("root").should eq "/"
+      router.build("static").should eq "/a%20b"
+      router.build("user", {id: 5}).should eq "/users/5"
+      router.build("files", {"path" => "a/b c"}).should eq "/files/a/b%20c"
     end
 
     it "raises on unknown route or missing param" do
-      router = Router.new.map(["GET"], "/users/:id", 1, :user)
+      router = Router.new.map(["GET"], "/users/:id", 1, name: "user")
 
-      expect_raises(Radbas::Routing::Error) { router.build(:nope) }
-      expect_raises(Radbas::Routing::Error) { router.build(:user) }
+      expect_raises(Radbas::Routing::Error) { router.build("nope") }
+      expect_raises(Radbas::Routing::Error) { router.build("user") }
+    end
+
+    it "raises on params the route would not match" do
+      router = Router.new
+      router.map("GET", "/users/:id:d", 1, name: "user")
+      router.map("GET", "/files/*path", 1, name: "files")
+
+      expect_raises(Radbas::Routing::Error) { router.build("user", {id: "abc"}) }
+      expect_raises(Radbas::Routing::Error) { router.build("user", {id: ""}) }
+      expect_raises(Radbas::Routing::Error) { router.build("files", {path: ""}) }
+    end
+
+    it "builds paths that match their route" do
+      router = Router.new
+      router.map("GET", "/u/:name/*rest", 1, name: "u")
+
+      path = router.build("u", {name: "a/b%", rest: "c d/e"})
+      path.should eq "/u/a%2Fb%25/c%20d/e"
+      router.match("GET", path).params.should eq({"name" => "a/b%", "rest" => "c d/e"})
     end
   end
 end
