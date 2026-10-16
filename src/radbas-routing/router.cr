@@ -95,28 +95,56 @@ class Radbas::Routing::Router(T)
 
   # Maps each of *methods* and *path* to *handler*, optionally naming the route for `#build`.
   #
-  # Mapping the same path again adds or replaces methods on the existing route.
-  # Raises `Error` on an invalid path, an unknown validator, or a name already used by another route.
+  # Mapping the same path again adds methods to the existing route.
+  # Raises `Error` if the path is invalid or can never match, if a method is already mapped
+  # for the path, or if *name* is used by another route. A rejected route changes nothing.
   def map(methods : Array(String), path : String, handler : T, *, name : String? = nil) : self
-    node = insert(path)
-    if name
-      existing = @named_routes[name]?
-      raise Error.new("Route name #{name} is already used") if existing && !existing.same?(node)
-      @named_routes[name] = node
+    raise Error.new("No methods given: #{path}") if methods.empty?
+    # the leading slash is optional
+    segments = path.lchop('/').split('/')
+    validate(path, segments)
+    node = find(path, segments)
+    if name && (named = @named_routes[name]?) && !named.same?(node)
+      raise Error.new("Route name #{name} is already used")
     end
+    if (handlers = node.try(&.handlers)) && (taken = methods.find { |method| handlers.has_key?(method) })
+      raise Error.new("Route #{taken} #{path} is already mapped")
+    end
+
+    node ||= insert(path, segments)
+    @named_routes[name] = node if name
     handlers = node.handlers ||= {} of String => T
     methods.each { |method| handlers[method] = handler }
     self
   end
 
-  private def insert(path : String) : Node(T)
+  # Returns the node of an existing route. Raises on a conflicting catchall.
+  private def find(path : String, segments : Array(String)) : Node(T)?
     node = @root
-    segments = path.lstrip('/').split('/')
-    static = true
-    segments.each_with_index do |segment, index|
+    segments.each do |segment|
       case segment[0]?
       when ':'
-        static = false
+        name, validator = parse_param(segment)
+        node = node.dynamic.find { |dynamic| dynamic.value == name && dynamic.validator == validator }
+      when '*'
+        name, validator = parse_param(segment)
+        node = node.catchall
+        if node && !(node.value == name && node.validator == validator)
+          raise Error.new("Conflicting catchall #{segment}: #{path}")
+        end
+      else
+        node = node.static[decode(segment).to_slice]?
+      end
+      return unless node
+    end
+    node
+  end
+
+  private def insert(path : String, segments : Array(String)) : Node(T)
+    node = @root
+    segments.each do |segment|
+      case segment[0]?
+      when ':'
         name, validator = parse_param(segment)
         child = node.dynamic.find { |dynamic| dynamic.value == name && dynamic.validator == validator }
         unless child
@@ -125,32 +153,42 @@ class Radbas::Routing::Router(T)
         end
         node = child
       when '*'
-        static = false
-        raise Error.new("Catchall must be the last segment: #{path}") unless index == segments.size - 1
         name, validator = parse_param(segment)
-        if child = node.catchall
-          unless child.value == name && child.validator == validator
-            raise Error.new("Conflicting catchall #{segment}: #{path}")
-          end
-          node = child
-        else
-          node = node.catchall = Node(T).new(:catch_all, node, name, validator)
-        end
+        # find ruled out a conflicting one
+        node = node.catchall ||= Node(T).new(:catch_all, node, name, validator)
       else
         value = decode(segment)
         node = node.static[value.to_slice] ||= Node(T).new(:static, node, value)
       end
     end
     # decoded "%2F" must not collide with a real "/"
-    @static_routes["/#{segments.join('/')}"] = node if static && !path.includes?('%')
+    if !path.includes?('%') && segments.none? { |segment| segment.starts_with?(':') || segment.starts_with?('*') }
+      @static_routes["/#{segments.join('/')}"] = node
+    end
     node
   end
 
+  # Rejects what can never match, before the tree is touched.
+  private def validate(path : String, segments : Array(String)) : Nil
+    # request paths never contain them
+    raise Error.new("Encode '?' and '#' as %3F and %23: #{path}") if path.includes?('?') || path.includes?('#')
+    names = [] of String
+    segments.each_with_index do |segment, index|
+      next unless segment.starts_with?(':') || segment.starts_with?('*')
+      if segment.starts_with?('*') && index != segments.size - 1
+        raise Error.new("Catchall must be the last segment: #{path}")
+      end
+      name, _ = parse_param(segment)
+      raise Error.new("Duplicate param #{name}: #{path}") if names.includes?(name)
+      names << name
+    end
+  end
+
   private def parse_param(segment : String) : {String, Validator?}
-    name, _, validator_name = segment.lchop.partition(':')
+    name, colon, validator_name = segment.lchop.partition(':')
     raise Error.new("Missing param name: #{segment}") if name.empty?
-    return {name, nil} if validator_name.empty?
-    validator = @validators[validator_name]? || raise Error.new("Validator #{validator_name} is not defined")
+    return {name, nil} if colon.empty?
+    validator = @validators[validator_name]? || raise Error.new("Validator #{validator_name.inspect} is not defined: #{segment}")
     {name, validator}
   end
 
@@ -168,13 +206,10 @@ class Radbas::Routing::Router(T)
       return Result(T).new(found[0])
     end
 
-    # skip leading slashes; "/" itself ends up at the empty segment
-    pos = 0
-    while pos < path.bytesize && path.to_unsafe[pos] == SLASH
-      pos += 1
-    end
-
-    found, params, methods = resolve(@root, path, pos, method, nil, nil)
+    # exactly one leading slash, so the router never sees a different path than a proxy in front of it
+    return Result(T).new unless path.starts_with?('/')
+    # "/" itself ends up at the empty segment
+    found, params, methods = resolve(@root, path, 1, method, nil, nil)
     return Result(T).new(found[0], params) if found
 
     # RFC 9110 9.3.2: GET implies HEAD

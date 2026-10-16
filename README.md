@@ -57,15 +57,28 @@ HTTP::Server.new(->(context : Context) {
 | `/*path`      | the non-empty rest of the path, as `path`  |
 | `/*path:name` | same, if validator `name` accepts the value |
 
-- Matching priority is static > dynamic > catchall. When a branch fails, the router backtracks to the next one.
-- A catchall must be the last segment.
+- Matching priority is static > dynamic > catchall, segment by segment from the left. When a branch fails, the router
+  backtracks to the next one. Dynamic segments at the same position are tried in the order they were mapped.
+- A catchall must be the last segment. Param names must be unique within a route.
+- Mapping a path again adds methods to it. Mapping a method that is already mapped for the path raises.
 - Segments are percent-decoded after the path is split, so `%2F` never acts as a separator.
-  Decoded params are not checked for valid UTF-8; use `String#valid_encoding?` if you need to.
+  Route definitions are decoded the same way: `/caf%C3%A9` and `/café` are the same route, and `/%3Aid` is the literal `:id`.
 - Matching is strict: `/a` and `/a/` are different routes, and so are `/a/b` and `/a//b`.
-  Leading slashes are ignored. The router does not normalize dot segments (`..`); that is the server's job.
+  A request path must start with exactly one `/`, so `//a` and `a` never match `/a`.
+  This keeps the router from seeing a different path than a proxy or cache in front of it.
+- Routes must not contain `?` or `#`, and `match` expects a path without query string.
 - `HEAD` falls back to the `GET` handler unless a `HEAD` handler is defined.
 - If the path matches but the method does not, `result.allowed_methods` lists the allowed methods, for the `Allow` header of a 405 response.
 - Define all routes before serving requests. Matching never mutates the router, so it is safe across threads.
+
+### Security
+
+Params are decoded but not sanitized. Validate them before use, especially catchalls:
+
+- Neither the router nor `HTTP::Server` removes dot segments. `/files/../../etc/passwd` and `/files/%2e%2e/%2e%2e/etc/passwd`
+  both yield `path = "../../etc/passwd"`. Never join a param into a filesystem path unchecked.
+- Values may contain `/` (from `%2F`), NUL bytes (`%00`) and invalid UTF-8 (`%FF`).
+  Use a validator, or `String#valid_encoding?`, where that matters.
 
 ### Validators
 

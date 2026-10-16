@@ -11,7 +11,7 @@ describe Radbas::Routing::Router do
       result.match?.should be_true
       result.handler.should eq 1
 
-      router.match("GET", "hello/world").handler.should eq 1
+      router.match("GET", "hello/world").match?.should be_false
       router.match("GET", "/hello/world/").match?.should be_false
     end
 
@@ -172,14 +172,26 @@ describe Radbas::Routing::Router do
       result.allowed_methods.should be_empty
     end
 
-    it "matches the root route with any number of leading slashes" do
+    it "requires exactly one leading slash" do
       router = Router.new
       router.map("GET", "/", 1)
-      router.map("GET", "/a", 2)
+      router.map("GET", "a", 2)
+      router.map("GET", "/:id", 3)
 
-      router.match("GET", "").handler.should eq 1
-      router.match("GET", "///").handler.should eq 1
-      router.match("GET", "//a").handler.should eq 2
+      router.match("GET", "/").handler.should eq 1
+      router.match("GET", "/a").handler.should eq 2
+      router.match("GET", "").match?.should be_false
+      router.match("GET", "//").match?.should be_false
+      router.match("GET", "//a").match?.should be_false
+      router.match("GET", "a").match?.should be_false
+      router.match("GET", "x").match?.should be_false
+    end
+
+    it "matches further leading slashes as empty segments" do
+      router = Router.new.map("GET", "//a", 1)
+
+      router.match("GET", "//a").handler.should eq 1
+      router.match("GET", "/a").match?.should be_false
     end
 
     it "treats trailing and double slashes as significant" do
@@ -275,11 +287,59 @@ describe Radbas::Routing::Router do
 
     it "rejects unknown validators" do
       expect_raises(Radbas::Routing::Error) { Router.new.map(["GET"], "/:id:nope", 1) }
+      expect_raises(Radbas::Routing::Error) { Router.new.map(["GET"], "/:id:", 1) }
+    end
+
+    it "rejects duplicate param names" do
+      expect_raises(Radbas::Routing::Error) { Router.new.map("GET", "/:id/x/:id", 1) }
+      expect_raises(Radbas::Routing::Error) { Router.new.map("GET", "/:id/*id", 1) }
+    end
+
+    it "rejects routes that can never match" do
+      expect_raises(Radbas::Routing::Error) { Router.new.map([] of String, "/a", 1) }
+      expect_raises(Radbas::Routing::Error) { Router.new.map("GET", "/search?q", 1) }
+      expect_raises(Radbas::Routing::Error) { Router.new.map("GET", "/a#b", 1) }
+    end
+
+    it "leaves no trace of rejected routes" do
+      router = Router.new
+      expect_raises(Radbas::Routing::Error) { router.map("GET", "/:a/x/:a", 1) }
+      router.map("GET", "/:b/x/y", 2)
+      router.map("GET", "/:a/x/:c", 3)
+
+      # :b was mapped first, so it is tried first
+      router.match("GET", "/1/x/y").params.should eq({"b" => "1"})
+    end
+
+    it "treats percent-encoded ':' and '*' as literals" do
+      router = Router.new.map("GET", "/%3Aid/%2A", 1)
+
+      router.match("GET", "/:id/*").handler.should eq 1
+      router.match("GET", "/x/y").match?.should be_false
     end
 
     it "rejects conflicting catchalls" do
       router = Router.new.map(["GET"], "/x/*a", 1)
       expect_raises(Radbas::Routing::Error) { router.map(["GET"], "/x/*b", 1) }
+    end
+
+    it "rejects methods already mapped for a path" do
+      router = Router.new.map(["GET", "POST"], "/a/:id", 1)
+
+      expect_raises(Radbas::Routing::Error) { router.map(["PUT", "POST"], "a/:id", 2) }
+      router.match("PUT", "/a/1").match?.should be_false
+      router.map("PUT", "/a/:id", 3).match("PUT", "/a/1").handler.should eq 3
+    end
+
+    it "leaves no trace of a route rejected for its name" do
+      router = Router.new.map("GET", "/a", 1, name: "a")
+
+      expect_raises(Radbas::Routing::Error) { router.map("GET", "/:b/x", 2, name: "a") }
+      router.map("GET", "/:c/y", 3)
+      router.map("GET", "/:b/y", 4)
+
+      # a leftover :b node would have been tried first
+      router.match("GET", "/1/y").handler.should eq 3
     end
 
     it "rejects duplicate route names" do
