@@ -1,178 +1,189 @@
 require "uri"
+require "./error"
 require "./node"
 require "./result"
 
+# Routes are matched in order of priority: static > dynamic > catchall.
+# The router is read-only while matching; define all routes before serving requests.
 class Radbas::Routing::Router(T)
-  private alias Validator = Proc(String, Bool)
+  alias Validator = Proc(String, Bool)
 
-  MAX_CACHE_SIZE = 1024_u16
-
-  @validators = {
+  VALIDATORS = {
     # word
-    w: ->(str : String) : Bool {
-      return false if str.empty?
-      str.squeeze { |char| return false unless char.ascii_alphanumeric? || char == '_' }
-      true
-    },
+    "w" => ->(str : String) { str.to_slice.all? { |byte| byte.chr.ascii_alphanumeric? || byte == '_'.ord } },
     # alphanumeric
-    a: ->(str : String) : Bool {
-      return false if str.empty?
-      str.squeeze { |char| return false unless char.ascii_alphanumeric? }
-      true
-    },
+    "a" => ->(str : String) { str.to_slice.all?(&.chr.ascii_alphanumeric?) },
     # letters
-    l: ->(str : String) : Bool {
-      return false if str.empty?
-      str.squeeze { |char| return false unless char.ascii_letter? }
-      true
-    },
+    "l" => ->(str : String) { str.to_slice.all?(&.chr.ascii_letter?) },
     # digits
-    d: ->(str : String) : Bool {
-      return false if str.empty?
-      str.squeeze { |char| return false unless char.ascii_number? }
-      true
-    },
+    "d" => ->(str : String) { str.to_slice.all?(&.chr.ascii_number?) },
   }
 
-  def initialize
-    @route_tree = Node(T).new
-    @named_routes = {} of Symbol => Node(T)
-    @cached_routes = {} of String => Result(T)
-    @node_handlers = {} of Node(T) => Hash(String, T)
-  end
+  @validators : Hash(String, Validator) = VALIDATORS.dup
+  @root = Node(T).new
+  @named_routes = {} of Symbol => Node(T)
+  # Routes without params, keyed by their decoded path.
+  @static_routes = {} of String => Node(T)
 
-  def set_validator(name : Symbol, validator : Validator) : self
+  def add_validator(name : String, &validator : String -> Bool) : self
     @validators[name] = validator
     self
   end
 
-  def has?(route : Symbol) : Bool
-    @named_routes.has_key?(route)
+  def has?(name : Symbol) : Bool
+    @named_routes.has_key?(name)
   end
 
-  def build(route : Symbol, args : NamedTuple? = nil) : String
-    node = @named_routes[route]?
-    raise "no route with name < #{route} > found" unless node
-    parts = [] of String
-    while node
-      value = node.value
-      unless node.type == Node::Type::STATIC
-        raise "no value given for placeholder < #{value} >" unless args.has_key?(value)
-        value = args[value].to_s
+  # `params` is anything indexable by param name, e.g. a `NamedTuple` or `Hash`.
+  def build(name : Symbol, params = NamedTuple.new) : String
+    node = @named_routes[name]? || raise Error.new("No route named #{name}")
+    segments = [] of String
+    while parent = node.parent
+      segments << case node.type
+      in .static?    then URI.encode_path_segment(node.value)
+      in .dynamic?   then URI.encode_path_segment(param(params, node.value))
+      in .catch_all? then URI.encode_path(param(params, node.value))
       end
-      if node.type == Node::Type::CATCHALL
-        parts << URI.encode_path(value)
-      else
-        parts << URI.encode_path_segment(value)
-      end
-      node = node.parent
+      node = parent
     end
-    parts.reverse.join("/")
+    "/#{segments.reverse!.join('/')}"
+  end
+
+  private def param(params, name : String) : String
+    value = params[name]? || raise Error.new("No value given for param #{name}")
+    value.to_s
   end
 
   def map(methods : Array(String), path : String, handler : T, name : Symbol? = nil) : self
-    leaf = apply(@route_tree, tokenize(path))
-    @node_handlers[leaf] ||= {} of String => T
-    methods.each { |method| @node_handlers[leaf][method] = handler }
-    @named_routes[name] = leaf if name
-    @cached_routes.clear
+    node = insert(path)
+    if name
+      existing = @named_routes[name]?
+      raise Error.new("Route name #{name} is already used") if existing && !existing.same?(node)
+      @named_routes[name] = node
+    end
+    handlers = node.handlers ||= {} of String => T
+    methods.each { |method| handlers[method] = handler }
     self
   end
 
-  private def apply(node : Node(T), tokens : Array(String)) : Node(T)
-    tokens.each do |token|
-      path = node.static
-      type = Node::Type::STATIC
-      value = token
-      validator = nil
-
-      if token.starts_with?(":") || token.starts_with?("*")
-        is_catchall = token[0] == '*'
-        token = token.lchop
-        split = token.split(":", 2)
-        if validator_name = split[1]?
-          validator = @validators[validator_name]?
-          raise "validator < #{validator_name} > is not defined" unless validator
+  private def insert(path : String) : Node(T)
+    node = @root
+    segments = path.lstrip('/').split('/')
+    static = true
+    segments.each_with_index do |segment, index|
+      case segment[0]?
+      when ':'
+        static = false
+        name, validator = parse_param(segment)
+        child = node.dynamic.find { |dynamic| dynamic.value == name && dynamic.validator == validator }
+        unless child
+          child = Node(T).new(:dynamic, node, name, validator)
+          node.dynamic << child
         end
-        return node.catchall[token] = Node(T).new(Node::Type::CATCHALL, node, split[0], validator) if is_catchall
-        path = node.dynamic
-        type = Node::Type::DYNAMIC
-        value = split[0]
+        node = child
+      when '*'
+        static = false
+        raise Error.new("Catchall must be the last segment: #{path}") unless index == segments.size - 1
+        name, validator = parse_param(segment)
+        if child = node.catchall
+          unless child.value == name && child.validator == validator
+            raise Error.new("Conflicting catchall #{segment}: #{path}")
+          end
+          node = child
+        else
+          node = node.catchall = Node(T).new(:catch_all, node, name, validator)
+        end
+      else
+        value = decode(segment)
+        node = node.static[value] ||= Node(T).new(:static, node, value)
       end
-
-      path[token] = Node(T).new(type, node, value, validator) unless path.has_key?(token)
-      node = path[token]
     end
+    # decoded "%2F" must not collide with a real "/"
+    @static_routes["/#{segments.join('/')}"] = node if static && !path.includes?('%')
     node
   end
 
-  def tokenize(path : String) : Array(String)
-    path.lstrip("/").split("/").map(&->URI.decode(String))
+  private def parse_param(segment : String) : {String, Validator?}
+    name, _, validator_name = segment.lchop.partition(':')
+    raise Error.new("Missing param name: #{segment}") if name.empty?
+    return {name, nil} if validator_name.empty?
+    validator = @validators[validator_name]? || raise Error.new("Validator #{validator_name} is not defined")
+    {name, validator}
   end
 
   def match(request : HTTP::Request) : Result(T)
     match(request.method, request.path)
   end
 
-  def match(method : String, path : String, params = {} of String => String) : Result(T)
-    method = "GET" if method == "HEAD"
-    cache_key = "#{method}#{path}"
-
-    if result = @cached_routes[cache_key]?
-      return result
+  def match(method : String, path : String) : Result(T)
+    if !path.includes?('%') && (node = @static_routes[path]?) && (found = handler(node, method))
+      return Result(T).new(found[0])
     end
 
-    tokens = tokenize(path)
-    result = resolve(@route_tree, tokens, method, params, 0, [] of String)
+    params = {} of String => String
+    methods = [] of String
+    segments = path.split('/').map! { |segment| decode(segment) }
+    # skip leading slashes without copying the path
+    start = segments.index(&.presence) || segments.size - 1
 
-    @cached_routes.shift? unless @cached_routes.size < MAX_CACHE_SIZE
-    @cached_routes[cache_key] = result
+    if found = resolve(@root, segments, start, method, params, methods)
+      return Result(T).new(found[0], methods.clear, params)
+    end
+
+    # RFC 9110 9.3.2: GET implies HEAD
+    methods << "HEAD" if methods.includes?("GET") && !methods.includes?("HEAD")
+    Result(T).new(methods: methods)
   end
 
-  # ameba:disable Metrics/CyclomaticComplexity
+  # Returns the handler wrapped in a tuple, so a falsey `T` still counts as a match.
+  # Params are only written once a match is certain.
   private def resolve(
-    node : Node,
-    tokens : Array(String),
+    node : Node(T),
+    segments : Array(String),
+    index : Int32,
     method : String,
     params : Hash(String, String),
-    index : Int32,
-    allowed_methods : Array(String),
-  ) : Result(T)
-    # end
-    unless token = tokens[index]?
-      handlers = @node_handlers[node]?
-      handler = handlers && handlers[method]?
-      methods = !handler && handlers ? handlers.keys : [] of String
-
-      return Result(T).new(handler, methods, params)
-    end
-
-    # static
-    if static_node = node.static[token]?
-      result = resolve(static_node, tokens, method, params, index + 1, allowed_methods)
-      return result if result.match?
-      allowed_methods.concat(result.methods)
-    end
-
-    # dynamic
-    node.dynamic.each_value do |dynamic_node|
-      next if dynamic_node.validator && !dynamic_node.validator.as(Validator).call(token)
-      result = resolve(dynamic_node, tokens, method, params, index + 1, allowed_methods)
-      if result.match?
-        result.params[dynamic_node.value] = token
-        return result
+    methods : Array(String),
+  ) : Tuple(T)?
+    unless segment = segments[index]?
+      found = handler(node, method)
+      if !found && (handlers = node.handlers)
+        handlers.each_key { |key| methods << key unless methods.includes?(key) }
       end
-      allowed_methods.concat(result.methods)
+      return found
     end
 
-    # catchall
-    node.catchall.each_value do |catchall_node|
-      next if catchall_node.validator && !catchall_node.validator.as(Validator).call(token)
-      params[catchall_node.value] = "#{tokens.skip(index).join("/")}"
-      return resolve(catchall_node, tokens, method, params, tokens.size, allowed_methods)
+    if child = node.static[segment]?
+      found = resolve(child, segments, index + 1, method, params, methods)
+      return found if found
     end
 
-    # token mismatch
-    Result(T).new(methods: allowed_methods.uniq)
+    node.dynamic.each do |dynamic|
+      next unless dynamic.valid?(segment)
+      if found = resolve(dynamic, segments, index + 1, method, params, methods)
+        params[dynamic.value] = segment
+        return found
+      end
+    end
+
+    return unless catchall = node.catchall
+    value = segments[index..].join('/')
+    return unless catchall.valid?(value)
+    return unless found = resolve(catchall, segments, segments.size, method, params, methods)
+    params[catchall.value] = value
+    found
+  end
+
+  private def handler(node : Node(T), method : String) : Tuple(T)?
+    return unless handlers = node.handlers
+    handler = handlers.fetch(method) do
+      return unless method == "HEAD" && handlers.has_key?("GET")
+      handlers["GET"]
+    end
+    {handler}
+  end
+
+  private def decode(segment : String) : String
+    segment.includes?('%') ? URI.decode(segment) : segment
   end
 end

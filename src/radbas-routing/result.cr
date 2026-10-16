@@ -3,6 +3,6 @@ record Radbas::Routing::Result(T),
   methods : Array(String) = [] of String,
   params : Hash(String, String) = {} of String => String do
   def match? : Bool
-    !!@handler
+    !@handler.nil?
   end
 end
