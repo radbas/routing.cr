@@ -11,7 +11,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: crystal-lang/install-crystal@v1
       - run: shards install
-      - run: crystal build -o bin/ameba lib/ameba/bin/ameba.cr
+      - run: mkdir -p bin && crystal build -o bin/ameba lib/ameba/bin/ameba.cr
       - run: crystal tool format --check
       - run: bin/ameba
       - run: crystal spec
